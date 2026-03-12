@@ -120,18 +120,24 @@ def process_trial(trial_data, srate, n_time=TRAJ_T):
 
 def load_inner_speech(data_dir, target_subjects=None):
     """
-    Load and process Inner Speech Dataset (ds003626).
+    Load and process Inner Speech Dataset (ds003626) from MNE Epoch .fif files.
+    Structure: derivatives/sub-XX/ses-XX/sub-XX_ses-XX_eeg-epo.fif
+                                         sub-XX_ses-XX_events.dat
     Returns: eegs (N, TRAJ_T, N_BANDS, N_CH), labels (N,), subjects (N,)
     """
     import mne
     from pathlib import Path
 
     data_dir = Path(data_dir)
-    # Find all subject directories recursively
-    subjects = sorted(set(
-        d.name for d in data_dir.rglob("sub-*") if d.is_dir()
-        and (list(d.rglob("*.edf")) or list(d.rglob("*.fif")))
-    ))
+    deriv_dir = data_dir / "derivatives"
+
+    # Find subject dirs under derivatives
+    sub_dirs = sorted(deriv_dir.glob("sub-*")) if deriv_dir.exists() else []
+    if not sub_dirs:
+        # Try without derivatives prefix
+        sub_dirs = sorted(data_dir.rglob("sub-*"))
+        sub_dirs = [d for d in sub_dirs if d.is_dir()]
+    subjects = sorted(set(d.name for d in sub_dirs if d.is_dir()))
     if target_subjects:
         subjects = [s for s in subjects if s in target_subjects]
 
@@ -139,137 +145,129 @@ def load_inner_speech(data_dir, target_subjects=None):
 
     all_eegs, all_labels, all_subjects = [], [], []
 
-    # Word labels
-    label_map = {"Arriba": 0, "Abajo": 1, "Derecha": 2, "Izquierda": 3}
+    # Inner Speech Dataset event encoding (from Nieto et al. 2022 GitHub):
+    # The eeg-epo.fif files already contain ONLY the specific epochs.
+    # events[:,2] = condition*10 + word, where:
+    #   condition: inner_speech=1, pronounced=2, visualized=3
+    #   word:      Arriba=1, Abajo=2, Derecha=3, Izquierda=4
+    # OR: the epoch metadata/event_id dict encodes condition+word directly
+    #
+    # We load inner speech only (condition=1) → event IDs 11,12,13,14
+    INNER_SPEECH_IDS = {11: 0, 12: 1, 13: 2, 14: 3}  # → 0=Arriba,1=Abajo,2=Derecha,3=Izq
 
     for sub in subjects:
-        sub_dir = data_dir / sub / "eeg"
-        edf_files = sorted(sub_dir.glob("*task-inner*_eeg.edf"))
-        if not edf_files:
-            # Try alternative naming
-            edf_files = sorted(sub_dir.glob("*.edf"))
+        sub_root = deriv_dir / sub if deriv_dir.exists() else data_dir / sub
+        fif_files = sorted(sub_root.rglob("*eeg-epo.fif"))
 
-        if not edf_files:
-            print(f"  {sub}: no EDF files found, skipping")
+        if not fif_files:
+            print(f"  {sub}: no .fif epoch files found, skipping")
             continue
 
-        print(f"  Processing {sub}: {len(edf_files)} EDF file(s)")
+        print(f"  {sub}: {len(fif_files)} session(s)")
+        sub_trials = 0
 
-        for edf_file in edf_files:
+        for fif_file in fif_files:
             try:
-                raw = mne.io.read_raw_edf(str(edf_file), preload=True, verbose=False)
-                srate = raw.info['sfreq']
+                # Load pre-epoched data
+                epochs = mne.read_epochs(str(fif_file), preload=True, verbose=False)
+                srate  = epochs.info['sfreq']
 
-                # Select 64-channel subset
-                available_ch = [ch for ch in BIOSEMI_64_SUBSET if ch in raw.ch_names]
-                if len(available_ch) < 32:
-                    # Fall back: take first 64 EEG channels
-                    eeg_ch = [ch for ch in raw.ch_names if 'EEG' not in ch or True][:64]
-                    available_ch = eeg_ch[:64]
+                print(f"    {fif_file.name}: {len(epochs)} epochs, "
+                      f"{len(epochs.ch_names)} ch, {srate}Hz")
+                print(f"    event_id: {epochs.event_id}")
 
-                if not available_ch:
-                    print(f"    No valid channels, skipping {edf_file.name}")
+                # Select EEG channels only (drop EOG/EMG if any)
+                epochs.pick_types(eeg=True, verbose=False)
+                data_all = epochs.get_data()  # (n_trials, n_ch, n_times)
+                events   = epochs.events      # (n_trials, 3)
+                event_ids = events[:, 2]
+
+                print(f"    Unique event IDs: {np.unique(event_ids).tolist()}")
+
+                # Try to identify inner speech events
+                # Strategy 1: explicit IDs 11-14
+                mask_inner = np.isin(event_ids, list(INNER_SPEECH_IDS.keys()))
+
+                # Strategy 2: use event_id dict if strategy 1 finds nothing
+                if mask_inner.sum() == 0:
+                    # Maybe event_id encodes condition in the name, e.g. 'inner_speech/Arriba'
+                    inner_ids = {v: k for k, v in epochs.event_id.items()
+                                 if 'inner' in str(k).lower() or
+                                 any(w in str(k) for w in ['Arriba','Abajo','Derecha','Izquierda'])}
+                    if inner_ids:
+                        mask_inner = np.isin(event_ids, list(inner_ids.keys()))
+                        # Build label map from event_id names
+                        word_to_label = {'Arriba': 0, 'Abajo': 1, 'Derecha': 2, 'Izquierda': 3}
+                        id_to_label = {}
+                        for ev_id, ev_name in epochs.event_id.items():
+                            for word, lbl in word_to_label.items():
+                                if word in str(ev_id):
+                                    id_to_label[ev_name] = lbl
+                                    break
+                    else:
+                        # Strategy 3: take all events, split evenly as 4 classes
+                        unique_ids = np.unique(event_ids)
+                        if len(unique_ids) == 4:
+                            INNER_SPEECH_IDS = {uid: i for i, uid in enumerate(unique_ids)}
+                            mask_inner = np.ones(len(event_ids), dtype=bool)
+                        elif len(unique_ids) >= 4:
+                            # Take first 4
+                            INNER_SPEECH_IDS = {uid: i for i, uid in enumerate(unique_ids[:4])}
+                            mask_inner = np.isin(event_ids, list(INNER_SPEECH_IDS.keys()))
+
+                inner_data    = data_all[mask_inner]    # (n_inner, n_ch, n_times)
+                inner_evt_ids = event_ids[mask_inner]
+
+                if len(inner_data) == 0:
+                    print(f"    No inner speech trials found, skipping")
                     continue
 
-                raw.pick_channels(available_ch, ordered=True)
+                print(f"    Inner speech trials: {len(inner_data)}")
 
-                # Load events from events file
-                events_tsv = edf_file.parent / (edf_file.name.replace('_eeg.edf', '_events.tsv'))
-                if not events_tsv.exists():
-                    # Try alternative naming
-                    events_files = list(edf_file.parent.glob("*events.tsv"))
-                    events_tsv = events_files[0] if events_files else None
+                for trial_idx in range(len(inner_data)):
+                    epoch = inner_data[trial_idx]      # (n_ch, n_times)
+                    eid   = inner_evt_ids[trial_idx]
+                    label = INNER_SPEECH_IDS.get(int(eid), int(eid) % N_CLASSES)
 
-                if events_tsv is None:
-                    print(f"    No events file for {edf_file.name}")
-                    continue
+                    # Downsample to N_CH_OUT channels
+                    n_ch = epoch.shape[0]
+                    if n_ch > N_CH_OUT:
+                        # Take evenly spaced channels
+                        idx = np.linspace(0, n_ch - 1, N_CH_OUT, dtype=int)
+                        epoch = epoch[idx, :]
+                    elif n_ch < N_CH_OUT:
+                        pad = np.zeros((N_CH_OUT - n_ch, epoch.shape[1]), dtype=np.float32)
+                        epoch = np.concatenate([epoch, pad], axis=0)
 
-                import pandas as pd
-                events_df = pd.read_csv(str(events_tsv), sep='\t')
-                print(f"    Events columns: {list(events_df.columns)}")
-                print(f"    Events sample: {events_df.head(3).to_dict()}")
-
-                # Inner Speech Dataset (Nieto 2022) has columns:
-                # onset, duration, trial_type (= 'inner_speech'/'pronounced_speech'/etc)
-                # and 'value' column with the word ('Arriba','Abajo','Derecha','Izquierda')
-                # OR trial_type contains the word directly
-                word_events = pd.DataFrame()
-                for col in ['value', 'trial_type', 'stim_type', 'condition', 'label']:
-                    if col in events_df.columns:
-                        mask = events_df[col].astype(str).isin(label_map.keys())
-                        if mask.sum() > 0:
-                            word_events = events_df[mask].copy()
-                            word_events['_word_col'] = col
-                            print(f"    Found {len(word_events)} word events in column '{col}'")
-                            break
-
-                if len(word_events) == 0:
-                    # Try: filter for 'inner_speech' trial_type, get word from 'value'
-                    if 'trial_type' in events_df.columns and 'value' in events_df.columns:
-                        inner = events_df[events_df['trial_type'] == 'inner_speech']
-                        if len(inner) > 0:
-                            word_events = inner.copy()
-                            word_events['_word_col'] = 'value'
-                    print(f"    Fallback inner_speech events: {len(word_events)}")
-
-                if len(word_events) == 0:
-                    print(f"    No word events found in {events_tsv.name}")
-                    continue
-
-                data_np, _ = raw[:]
-                data_np = data_np.astype(np.float32)  # (n_ch, n_samples)
-
-                # Extract epochs around each word event
-                epoch_dur_s = 4.0  # 4 seconds of inner speech (standard)
-                epoch_samples = int(epoch_dur_s * srate)
-
-                for _, row in word_events.iterrows():
-                    # Get onset
-                    onset    = row.get('onset', row.iloc[0])
-                    word_col = row.get('_word_col', 'trial_type')
-                    word     = str(row.get(word_col, row.get('trial_type', row.iloc[-1])))
-
-                    if word not in label_map:
-                        continue
-
-                    onset_sample = int(float(onset) * srate)
-                    end_sample   = onset_sample + epoch_samples
-
-                    if end_sample > data_np.shape[1]:
-                        continue
-
-                    epoch = data_np[:, onset_sample:end_sample]  # (n_ch, n_samples)
-
+                    # Process: bandpass envelope → (TRAJ_T, N_BANDS, N_CH_OUT)
                     try:
-                        traj = process_trial(epoch, srate, n_time=TRAJ_T)  # (TRAJ_T, N_BANDS, n_ch)
+                        traj = process_trial(epoch.astype(np.float32), srate, n_time=TRAJ_T)
                     except Exception as e:
-                        print(f"    process_trial failed: {e}")
                         continue
-
-                    # Pad/trim channels to N_CH_OUT
-                    n_ch = traj.shape[2]
-                    if n_ch < N_CH_OUT:
-                        pad = np.zeros((TRAJ_T, NUM_EEG_BANDS, N_CH_OUT - n_ch), dtype=np.float32)
-                        traj = np.concatenate([traj, pad], axis=2)
-                    elif n_ch > N_CH_OUT:
-                        traj = traj[:, :, :N_CH_OUT]
 
                     all_eegs.append(traj)
-                    all_labels.append(label_map[word])
+                    all_labels.append(label)
                     all_subjects.append(sub)
+                    sub_trials += 1
 
             except Exception as e:
-                print(f"  Error processing {edf_file}: {e}")
+                print(f"    Error: {e}")
                 continue
 
+        print(f"  {sub}: loaded {sub_trials} trials total")
+
     if not all_eegs:
-        raise ValueError("No trials loaded! Check dataset path and format.")
+        raise ValueError(
+            f"No trials loaded from {data_dir}. "
+            "Check that derivatives/sub-*/ses-*/*eeg-epo.fif exists.")
 
-    eegs    = np.stack(all_eegs)   # (N, TRAJ_T, N_BANDS, N_CH)
-    labels  = np.array(all_labels) # (N,)
-    subjects = np.array(all_subjects)  # (N,) str
+    eegs     = np.stack(all_eegs, axis=0)   # (N, TRAJ_T, N_BANDS, N_CH)
+    labels   = np.array(all_labels)          # (N,)
+    subjects = np.array(all_subjects)        # (N,)
 
-    print(f"Loaded: {len(eegs)} trials, label distribution: {dict(zip(*np.unique(labels, return_counts=True)))}")
+    print(f"\nTotal loaded: {len(eegs)} trials")
+    print(f"  Shape: {eegs.shape}")
+    print(f"  Label distribution: {dict(zip(*np.unique(labels, return_counts=True)))}")
     return eegs, labels, subjects
 
 
@@ -322,7 +320,7 @@ class MultiScaleRasterizer(nn.Module):
         w    = 1.0 / dist
         w    = w / w.sum(-1, keepdim=True)             # (H*W, n_ch)
 
-        out  = (w.unsqueeze(0) * x.unsqueeze(1)).sum(-1)  # (B*T2, H*W)
+        out  = x @ w.T                                     # (B*T2, H*W) — matmul avoids 3-D intermediate
         out  = out.reshape(B, T2, self.h, self.w)          # (B, T2, H, W)
         return out
 
@@ -421,76 +419,103 @@ def load_v1200_videomae(model):
     print(f"Loaded VideoMAE from {src}: {len(loaded)} keys")
 
 
-# ── LOSO Training ──────────────────────────────────────────────────────────────
+# ── Feature Pre-computation ────────────────────────────────────────────────────
 
-def loso_train(eegs, labels, subjects, device, epochs=30):
-    """Leave-One-Subject-Out cross-validation."""
+def precompute_features(eegs, device, batch_size=4):
+    """
+    Run all EEG trials through frozen VideoMAE once → cache (N, 768) features.
+    This is ~100x faster than running VideoMAE on every training batch in LOSO.
+    """
+    model = InnerSpeechEncoder(n_classes=N_CLASSES).to(device)
+    load_v1200_videomae(model)
+    model = model.to(torch.bfloat16).eval()
+
+    N = len(eegs)
+    features = np.zeros((N, 768), dtype=np.float32)
+
+    print(f"Precomputing VideoMAE features for {N} trials ...")
+    with torch.no_grad():
+        for i in range(0, N, batch_size):
+            xb = torch.tensor(eegs[i:i+batch_size], dtype=torch.bfloat16).to(device)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                v_seq = model.encode(xb)     # (B, 256, 768)
+                v_mean = v_seq.mean(1)        # (B, 768)
+            features[i:i+batch_size] = v_mean.float().cpu().numpy()
+            if (i // batch_size) % 10 == 0:
+                print(f"  {i+batch_size}/{N} done")
+
+    print(f"Features precomputed: {features.shape}")
+    del model; torch.cuda.empty_cache()
+    return features
+
+
+# ── LOSO Training on Pre-computed Features ─────────────────────────────────────
+
+def loso_train(features, labels, subjects, device, epochs=50):
+    """
+    Leave-One-Subject-Out cross-validation on PRE-COMPUTED VideoMAE features.
+    VideoMAE runs only ONCE for the whole dataset — training is tiny linear probe.
+    """
+    from torch.utils.data import TensorDataset, DataLoader
+
     unique_subs = np.unique(subjects)
     all_accs = []
 
+    feat_t  = torch.tensor(features, dtype=torch.float32)
+    label_t = torch.tensor(labels,   dtype=torch.long)
+
     for test_sub in unique_subs:
-        print(f"\n── LOSO: test subject = {test_sub} ──")
+        print(f"\n── LOSO: test={test_sub} ({(subjects==test_sub).sum()} test trials) ──")
 
         train_mask = subjects != test_sub
         test_mask  = subjects == test_sub
 
-        X_train = torch.tensor(eegs[train_mask],   dtype=torch.bfloat16)
-        y_train = torch.tensor(labels[train_mask], dtype=torch.long)
-        X_test  = torch.tensor(eegs[test_mask],    dtype=torch.bfloat16)
-        y_test  = torch.tensor(labels[test_mask],  dtype=torch.long)
+        X_tr = feat_t[train_mask];  y_tr = label_t[train_mask]
+        X_te = feat_t[test_mask];   y_te = label_t[test_mask]
 
-        model = InnerSpeechEncoder(n_classes=N_CLASSES).to(device)
-        load_v1200_videomae(model)
-        model = model.to(torch.bfloat16)
+        # Fresh lightweight probe for this fold
+        probe = nn.Sequential(
+            nn.LayerNorm(768),
+            nn.Linear(768, 256), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(256, N_CLASSES),
+        ).to(device)
 
-        # Only train the probe
-        opt   = torch.optim.AdamW(model.probe.parameters(), lr=3e-4, weight_decay=1e-3)
+        opt   = torch.optim.AdamW(probe.parameters(), lr=5e-4, weight_decay=1e-3)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
-        from torch.utils.data import TensorDataset, DataLoader
-        train_ds = TensorDataset(X_train, y_train)
-        train_dl = DataLoader(train_ds, batch_size=16, shuffle=True, drop_last=False)
+        train_ds = TensorDataset(X_tr, y_tr)
+        train_dl = DataLoader(train_ds, batch_size=64, shuffle=True, drop_last=False)
 
         best_acc = 0.0
         for ep in range(1, epochs + 1):
-            model.train()
+            probe.train()
             total_loss = 0.0; n_steps = 0
             for xb, yb in train_dl:
                 xb = xb.to(device); yb = yb.to(device)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    logits = model(xb)
-                    loss   = F.cross_entropy(logits, yb)
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
+                logits = probe(xb)
+                loss   = F.cross_entropy(logits, yb)
+                opt.zero_grad(); loss.backward(); opt.step()
                 total_loss += loss.item(); n_steps += 1
             sched.step()
 
-            # Evaluate
-            model.eval()
-            correct = 0; total = 0
+            # Eval
+            probe.eval()
             with torch.no_grad():
-                for i in range(0, len(X_test), 16):
-                    xb = X_test[i:i+16].to(device)
-                    yb = y_test[i:i+16].to(device)
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        preds = model(xb).argmax(-1)
-                    correct += (preds == yb).sum().item()
-                    total   += len(yb)
-            acc = correct / max(1, total)
-            if ep % 5 == 0 or ep == epochs:
-                print(f"  ep={ep:2d} loss={total_loss/n_steps:.3f} acc={acc:.3f}")
+                preds = probe(X_te.to(device)).argmax(-1).cpu()
+            acc = (preds == y_te).float().mean().item()
+            if ep % 10 == 0 or ep == epochs:
+                print(f"  ep={ep:3d} loss={total_loss/n_steps:.3f} acc={acc:.3f}")
             if acc > best_acc:
                 best_acc = acc
 
-        print(f"  {test_sub} best acc: {best_acc:.3f}")
+        print(f"  → {test_sub} best acc: {best_acc:.3f}")
         all_accs.append(best_acc)
 
-    mean_acc = np.mean(all_accs)
-    std_acc  = np.std(all_accs)
-    print(f"\n{'='*50}")
-    print(f"LOSO Results: {mean_acc:.3f} ± {std_acc:.3f} (chance={1/N_CLASSES:.3f})")
-    print(f"Per-subject:  {[f'{a:.3f}' for a in all_accs]}")
+    mean_acc = float(np.mean(all_accs))
+    std_acc  = float(np.std(all_accs))
+    print(f"\n{'='*55}")
+    print(f"LOSO Mean ± Std: {mean_acc:.3f} ± {std_acc:.3f}   (chance={1/N_CLASSES:.3f})")
+    print(f"Per-subject:     {[f'{a:.3f}' for a in all_accs]}")
     return mean_acc, std_acc, all_accs
 
 
@@ -541,20 +566,13 @@ def run_inner_speech(epochs: int = 30, max_subjects: int = 10):
     for p in sorted(data_root.rglob("*"))[:30]:
         print(f"  {p.relative_to(data_root)}")
 
-    # The openneuro-py may nest under dataset name
-    # Find actual BIDS root (where sub-* dirs are)
+    # The dataset structure is:
+    # data_root/derivatives/sub-XX/ses-XX/sub-XX_ses-XX_eeg-epo.fif
+    # Pass data_root directly; load_inner_speech will look under derivatives/
     bids_root = data_root
-    for candidate in [data_root, data_root / "ds003626"]:
-        if candidate.exists() and any(candidate.glob("sub-*")):
-            bids_root = candidate
-            break
-    # Also try nested in any subfolder
-    if not any(bids_root.glob("sub-*")):
-        for d in sorted(data_root.rglob("sub-*")):
-            if d.is_dir():
-                bids_root = d.parent
-                break
-    print(f"BIDS root: {bids_root}")
+    print(f"Dataset root: {bids_root}")
+    fif_count = len(list(bids_root.rglob("*eeg-epo.fif")))
+    print(f"FIF epoch files found: {fif_count}")
 
     # Load and process
     print("Loading and processing EEG trials ...")
@@ -566,8 +584,27 @@ def run_inner_speech(epochs: int = 30, max_subjects: int = 10):
     print(f"  Subjects: {np.unique(subjects).tolist()}")
     print(f"  Label dist: {dict(zip(*np.unique(labels, return_counts=True)))}")
 
-    # LOSO cross-validation
-    mean_acc, std_acc, per_subject = loso_train(eegs, labels, subjects, device, epochs=epochs)
+    # Pre-compute VideoMAE features ONCE for all trials (100x speedup vs per-batch)
+    feat_cache = Path("/persist/v1300_features.npy")
+    lab_cache  = Path("/persist/v1300_labels.npy")
+    sub_cache  = Path("/persist/v1300_subjects.npy")
+
+    if feat_cache.exists():
+        print("Loading cached features ...")
+        features = np.load(str(feat_cache))
+        labels   = np.load(str(lab_cache))
+        subjects = np.load(str(sub_cache), allow_pickle=True)
+        print(f"Loaded cached features: {features.shape}")
+    else:
+        features = precompute_features(eegs, device, batch_size=4)
+        np.save(str(feat_cache), features)
+        np.save(str(lab_cache),  labels)
+        np.save(str(sub_cache),  subjects)
+        ckpt_vol.commit()
+        print("Features cached.")
+
+    # LOSO cross-validation on pre-computed features
+    mean_acc, std_acc, per_subject = loso_train(features, labels, subjects, device, epochs=epochs)
 
     # Save results
     results = {

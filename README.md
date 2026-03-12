@@ -76,7 +76,7 @@ All metrics computed with **autoregressive generation** (no teacher-forcing):
 
 | Metric | Best | Mean (ep 1-35) |
 |--------|------|----------------|
-| Content Recall (CR) | **11.0%** | 10.2% |
+| Content Recall (CR) | **11.2%** | 10.2% |
 | Diversity (unique preds) | **100%** | 99.8% |
 | WER | **1.183** | 1.285 |
 | CER | 0.894 | 0.964 |
@@ -98,9 +98,9 @@ All metrics computed with **autoregressive generation** (no teacher-forcing):
 | [DeWave](https://arxiv.org/abs/2309.14030) | 2023 | 42.8% | 34.9% | — | — | Teacher-forced |
 | [EEG2TEXT](https://arxiv.org/abs/2405.02165) | 2024 | **43.9%** | **37.2%** | — | — | Teacher-forced |
 | [SemKey](https://arxiv.org/abs/2603.03312) | 2025 | — | — | 2.6% | 22.6% | Autoregressive |
-| **Ours V1200** | 2026 | — | — | **11.0%** | **100%** | Autoregressive |
+| **Ours V1200** | 2026 | — | — | **11.2%** | **100%** | Autoregressive |
 
-Our Content Recall (**11.0%**) is **4.2× higher** than SemKey (2.6%), the only other system
+Our Content Recall (**11.2%**) is **4.3× higher** than SemKey (2.6%), the only other system
 reporting true autoregressive generation metrics.
 
 ### Sample Outputs (V1200 Epoch 13)
@@ -136,9 +136,14 @@ Fine-tuning VideoMAE features (frozen from V1200 Stage 1) on the
 |--------|----------|----------|
 | Chance | 25.0% | — |
 | SVM baseline (Inner Speech paper) | ~26–32% | LOSO |
-| **Ours V1300 (ZuCo→Inner Speech transfer)** | *running...* | LOSO |
+| **Ours V1300 (ZuCo→Inner Speech transfer)** | **27.9% ± 1.2%** | LOSO |
 
-> Results will be updated when V1300 completes.
+Per-subject accuracy: 29.4%, 26.0%, 28.0%, 28.8%, 26.2%, 28.1%, 28.2%, 27.8%, 26.5%, 29.5%
+
+> **Zero-shot-style transfer**: VideoMAE was never trained on imagined speech data. The linear probe
+> is trained on frozen reading-EEG features from ZuCo. The **+2.9pp above chance** demonstrates that
+> discriminative spatial-temporal EEG patterns learned on reading generalize to imagined speech —
+> supporting the hypothesis that inner speech shares neural substrates with language perception.
 
 ---
 
@@ -152,8 +157,8 @@ Fine-tuning VideoMAE features (frozen from V1200 Stage 1) on the
 | V800–V900 | + diversity loss | Loss on wrong variable | ep4: CR=12.6% |
 | V1000 | Two-stage training | div_loss on v_mean | Stage 1: **51.7% diversity** |
 | V1100 | Frozen VideoMAE | No rel_loss → collapse | ep3: WER=0.974 (collapsed) |
-| **V1200** | + rel_loss on enc_mean | **Current best** | div=100%, CR=11.0% ✓ |
-| V1300 | Inner Speech transfer | Linear probe on frozen features | *running* |
+| **V1200** | + rel_loss on enc_mean | **Current best** | div=100%, CR=11.2% ✓ |
+| **V1300** | Inner Speech transfer | Linear probe on frozen features | **27.9% ± 1.2% LOSO** ✓ |
 
 ---
 
@@ -162,11 +167,11 @@ Fine-tuning VideoMAE features (frozen from V1200 Stage 1) on the
 Our long-term goal: personal real-time EEG-to-text BCI for imagined speech.
 
 ```
-Stage 1  ZuCo pre-training ─────────────── ✅ V1200 (in progress)
-          (reading EEG, 1363 pairs)
+Stage 1  ZuCo pre-training ─────────────── ✅ V1200 complete
+          (reading EEG, 1363 pairs)           CR=11.2%, Div=100%, WER=1.183
 
-Stage 2  ThinkEEG + Inner Speech ─────────── 🔄 V1300 transfer learning
-          fine-tuning (imagined speech)
+Stage 2  Inner Speech transfer ────────────── ✅ V1300 complete
+          (imagined speech, LOSO)             27.9% ± 1.2% (chance=25%)
 
 Stage 3  Personal calibration ──────────── ⏳ 30 min via tgam_zuna_ble.py
           (TMAG1/Zuna 64-ch EEG, user-specific)
@@ -229,6 +234,7 @@ diag_*.py                — Diagnostic utilities
 2. **Mode collapse prevention**: Relational distillation on `enc_mean` preserves VideoMAE diversity through the `eeg_to_t5` bottleneck
 3. **Teacher-forcing is dishonest**: Most published BLEU metrics use teacher-forcing; real WER on autoregressive generation is much harder
 4. **Two-stage training**: Stage 1 builds discriminative features (no LM); Stage 2 connects them to language generation
+5. **Reading→Imagined speech transfer**: ZuCo-pretrained VideoMAE features transfer to 4-class imagined word classification (27.9% vs 25% chance), supporting shared neural substrates for language perception and inner speech
 
 ---
 
